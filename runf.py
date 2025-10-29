@@ -1,30 +1,19 @@
-import mainnew as main
+import wt as main
 import serial
-import time
+import time,math
 
-# Array to store 7 days of temperature
-weekly_temps = []
-MAX_DAYS = 7
+from autonomic import update_weekly_avg, autonomic_plane
 
-def update_weekly_avg(current_temp):
-    global weekly_temps
+def bell_curve_efficiency(temp_c):
+    """
+    Bell curve model centered at 25°C.
+    Efficiency reduces as temperature deviates from 25°C.
+    """
+    optimal_temp = 25
+    sigma = 10   # spread of the curve
+    efficiency = math.exp(-((temp_c - optimal_temp) ** 2) / (2 * sigma ** 2))
+    return efficiency  # between 0 and 1
 
-    if len(weekly_temps) < MAX_DAYS:
-        weekly_temps.append(current_temp)
-    else:
-        weekly_temps.pop(0)
-        weekly_temps.append(current_temp)
-
-    # Calculate average temperature for environmental adaptation
-    weekly_avg = sum(weekly_temps) / len(weekly_temps)
-    return weekly_avg
-
-def autonomic_plane(current_temp, weekly_avg):
-    # If deviation > ±10, impute with weekly average
-    if abs(current_temp - weekly_avg) > 10:
-        print(f"Temperature deviation detected. Imputing {current_temp} with weekly average {weekly_avg}.")
-        current_temp = weekly_avg
-    return current_temp
 
 def get_weather_prediction(weather):
     weather_mapping = {
@@ -39,6 +28,7 @@ def get_weather_prediction(weather):
     }
     return weather_mapping.get(weather, 0)  # Default to cloudy if not matched
 
+
 def manage_battery():
     hardware_enabled = input("Enable smartwatch hardware communication? (y/n): ").lower() == 'y'
     smartwatch = None
@@ -52,29 +42,57 @@ def manage_battery():
             print(f"Error connecting to smartwatch: {e}")
             hardware_enabled = False
 
-    api_key = ""
+    api_key = "59fa7bff31936dcd5ba90343da033b98"
+    
     charge = int(input("Enter current smartwatch battery percentage: "))
-    current_temp = float(input("Enter current ambient temperature (°C): "))
 
-    weekly_avg = update_weekly_avg(current_temp)
-    current_temp = autonomic_plane(current_temp, weekly_avg)
+
+    if charge < 30:
+        print("Battery critically low. Charging to 40% minimum for GPS/Zigbee readiness.")
+        charge = 40
+        if hardware_enabled:
+            smartwatch.write(b'1\n')
+            print("Sent charging signal to PMU.")
+        else:
+            print("[Simulated] Charging signal sent to PMU.")
 
     choice = input("Enter 0 to use weather API or 1 to enter conditions manually: ")
 
     try:
         if choice == '0':
             print("Fetching next day's weather forecast...")
-            weather = main.fetch_weather(api_key)
-            print(f"Forecast retrieved: {weather}")
+            weather, forecast_temp, efficiency = main.fetch_weather(api_key)
+            print(f"Forecast retrieved: {weather}, Temperature: {forecast_temp}°C, Efficiency: {efficiency:.2f}")
+            
+            # Use forecast temperature for weekly average and autonomic plane
+            weekly_avg = update_weekly_avg(forecast_temp)
+            forecast_temp = autonomic_plane(forecast_temp, weekly_avg)
+            
             ndw = get_weather_prediction(weather)
+            solar_forecast = efficiency * (1.0 if ndw == 1 else 0.6 if ndw == 0 else 0.3)
+
+            print(f"Combined Solar Forecast Score: {solar_forecast:.2f}")
+
         elif choice == '1':
             print("Enter weather condition:")
             print("1 for Sunny, 0 for Cloudy, -1 for Rainy")
             ndw = int(input())
+            
+            # Ask user for forecast temperature
+            forecast_temp = float(input("Enter forecast temperature (°C): "))
+            
+            # Use forecast temperature for weekly average and autonomic plane
+            weekly_avg = update_weekly_avg(forecast_temp)
+            forecast_temp = autonomic_plane(forecast_temp, weekly_avg)
+            
+            efficiency = bell_curve_efficiency(forecast_temp)
+            solar_forecast = efficiency * (1.0 if ndw == 1 else 0.6 if ndw == 0 else 0.3)
+            print(f"Manual Solar Forecast Score: {solar_forecast:.2f}")
         else:
             print("Invalid choice. Exiting.")
             return
 
+        # -------------------- Adaptive Charging Strategy --------------------
         if charge < 30:
             print("Battery critically low. Charging to 40% minimum for GPS/Zigbee readiness.")
             charge = 40
@@ -85,11 +103,10 @@ def manage_battery():
                 print("[Simulated] Charging signal sent to PMU.")
 
         elif 30 <= charge < 100:
-            print("Processing adaptive charging strategy based on weather prediction...")
+            print("Processing adaptive charging strategy based on solar forecast...")
 
-            if ndw == 1:
-                print("Clear weather predicted — solar charging expected.")
-                print("Limiting night charging to 30%. Using solar energy during daylight.")
+            if solar_forecast > 0.75:
+                print("High solar potential — limit night charging to 30%. Use solar energy during daylight.")
                 charge = 30
                 if hardware_enabled:
                     smartwatch.write(b'0\n')
@@ -97,26 +114,25 @@ def manage_battery():
                 else:
                     print("[Simulated] Low-charge mode activated.")
 
-            elif ndw == 0:
-                print("Cloudy conditions predicted — partial solar availability.")
-                print("Charging battery up to 70% for safe GPS operation.")
-                charge = 70
+            elif 0.4 < solar_forecast <= 0.75:
+                print("Moderate solar potential — charge up to 60% for safe GPS operation.")
+                charge = 60
                 if hardware_enabled:
                     smartwatch.write(b'1\n')
                     print("Sent moderate-charge command to PMU.")
                 else:
                     print("[Simulated] Moderate-charge mode activated.")
 
-            elif ndw == -1:
-                print("Rainy conditions predicted — low solar input expected.")
-                print("Charging battery up to 80% using stored power sources (e.g., power bank).")
-                charge = 80
+            else:
+                print("Low solar potential , Fully charging the smartwatch")
+                charge = 100
                 if hardware_enabled:
                     smartwatch.write(b'1\n')
                     print("Sent full-charge command to PMU.")
                 else:
                     print("[Simulated] Full-charge mode activated.")
 
+        # -------------------- PMU RESPONSE HANDLING --------------------
         if hardware_enabled:
             time.sleep(1)
             while smartwatch.in_waiting:
@@ -130,6 +146,7 @@ def manage_battery():
         if smartwatch:
             smartwatch.close()
             print("Smartwatch PMU connection closed.")
+
 
 if __name__ == "__main__":
     manage_battery()
